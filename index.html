@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NH Tax Vote Tracker - How Much Did They Vote to Raise YOUR Taxes?</title>
     <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Oswald:wght@400;600;700&family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+    <script src="config.js"></script>
     <style>
         * {
             margin: 0;
@@ -860,11 +862,19 @@
         <section class="search-section">
             <div class="container">
                 <div class="search-tabs">
-                    <button class="tab-button active" onclick="switchTab('town')">Search by Town</button>
+                    <button class="tab-button active" onclick="switchTab('address')">Search by Address</button>
+                    <button class="tab-button" onclick="switchTab('town')">Search by Town</button>
                     <button class="tab-button" onclick="switchTab('rep')">Search by Representative</button>
                 </div>
-                
-                <div class="search-box" id="townSearch">
+
+                <div class="search-box" id="addressSearch">
+                    <label class="search-label" for="addressInput">Enter Your Address:</label>
+                    <input type="text" id="addressInput" placeholder="123 Main St, Concord, NH" autocomplete="off">
+                    <button class="find-rep-button" id="findRepButton">Find My Reps</button>
+                    <div id="addressLookupStatus" style="display:none; text-align:center; margin-top:15px; color: var(--warning-yellow); font-size:1.1rem;"></div>
+                </div>
+
+                <div class="search-box" id="townSearch" style="display: none;">
                     <label class="search-label" for="townInput">Enter Your Town:</label>
                     <input type="text" id="townInput" placeholder="Type your town name..." autocomplete="off">
                 </div>
@@ -16327,30 +16337,20 @@
 
         // Tab switching function
         function switchTab(tab) {
+            const addressSearch = document.getElementById('addressSearch');
             const townSearch = document.getElementById('townSearch');
             const repSearch = document.getElementById('repSearch');
             const tabs = document.querySelectorAll('.tab-button');
-            
-            if (tab === 'town') {
-                townSearch.style.display = 'block';
-                repSearch.style.display = 'none';
-                tabs[0].classList.add('active');
-                tabs[1].classList.remove('active');
-                document.getElementById('results').innerHTML = '';
-            } else {
-                townSearch.style.display = 'none';
-                repSearch.style.display = 'block';
-                tabs[0].classList.remove('active');
-                tabs[1].classList.add('active');
-                document.getElementById('results').innerHTML = '';
-            }
-        }
 
-        // Get all town names for autocomplete
-        const towns = Object.keys(votingData).sort();
-        
-        // Get all representative names for autocomplete
-        const repNames = allRepresentatives.map(r => r.name).sort();
+            addressSearch.style.display = (tab === 'address') ? 'block' : 'none';
+            townSearch.style.display = (tab === 'town') ? 'block' : 'none';
+            repSearch.style.display = (tab === 'rep') ? 'block' : 'none';
+
+            tabs.forEach(t => t.classList.remove('active'));
+            const idx = (tab === 'address') ? 0 : (tab === 'town') ? 1 : 2;
+            if (tabs[idx]) tabs[idx].classList.add('active');
+            document.getElementById('results').innerHTML = '';
+        }
 
         // Autocomplete functionality for TOWN search
         const townInput = document.getElementById('townInput');
@@ -16416,86 +16416,237 @@
             }
         });
 
-        // Address lookup functionality
+        // ── Address lookup: Mapbox autocomplete + GeoJSON point-in-polygon ───
+        // MAPBOX_TOKEN is set by config.js (gitignored, written at deploy time)
+        const MAPBOX_TOKEN = (typeof window !== 'undefined' && window.MAPBOX_TOKEN) || '';
         const addressInput = document.getElementById('addressInput');
         const findRepButton = document.getElementById('findRepButton');
-        
-        // Ward mapping data (to be populated by GitHub integration)
-        // This object maps ward identifiers to their legislative districts
-        // Format: { "MANCHESTER WARD 1": ["Hillsborough 20"], "NASHUA WARD 3": ["Hillsborough 30"], ... }
-        // 
-        // Example entries:
-        // "MANCHESTER WARD 1": ["Hillsborough 20"],
-        // "MANCHESTER WARD 2": ["Hillsborough 21"],
-        // "NASHUA WARD 1": ["Hillsborough 25", "Hillsborough 26"],
-        // "CONCORD WARD 3": ["Merrimack 15"],
-        // etc.
-        //
-        // To add ward data: populate this object with the city name (uppercase), ward number,
-        // and the corresponding legislative district(s) for that ward.
-        const wardMapping = {};
-        
-        function parseAddress(addressString) {
-            // Extract city/town and ward info from address
-            const upperAddress = addressString.toUpperCase().trim();
-            
-            // Check for ward patterns in cities
-            // Format: "123 Main St, Manchester Ward 5" or "Manchester, Ward 5" or just "Manchester"
-            const wardMatch = upperAddress.match(/WARD\s+(\d+)/);
-            
-            // Extract city name (everything after last comma, or whole string if no comma)
-            let cityPart = upperAddress;
-            if (upperAddress.includes(',')) {
-                const parts = upperAddress.split(',');
-                cityPart = parts[parts.length - 1].trim();
-            }
-            
-            // Remove "NH" if present
-            cityPart = cityPart.replace(/\s+NH\s*$/, '').trim();
-            
-            // Extract just the city name (remove ward info)
-            const cityName = cityPart.replace(/WARD\s+\d+/, '').trim();
-            
-            return {
-                city: cityName,
-                ward: wardMatch ? parseInt(wardMatch[1]) : null,
-                fullKey: wardMatch ? `${cityName} Ward ${wardMatch[1]}` : cityName
-            };
+        const addressLookupStatus = document.getElementById('addressLookupStatus');
+
+        // County prefix → 2-letter geo code (matches geojson basehse22 / floathse22)
+        const COUNTY_TO_CODE = {
+            'BELK': 'BE', 'BELKNAP': 'BE',
+            'CARR': 'CA', 'CARROLL': 'CA',
+            'CHES': 'CH', 'CHESHIRE': 'CH',
+            'COOS': 'CO',
+            'GRAF': 'GR', 'GRAFTON': 'GR',
+            'HILLS': 'HI', 'HILLSBOROUGH': 'HI',
+            'MERR': 'ME', 'MERRIMACK': 'ME',
+            'ROCK': 'RO', 'ROCKINGHAM': 'RO',
+            'STRAF': 'ST', 'STRAFFORD': 'ST',
+            'SULL': 'SU', 'SULLIVAN': 'SU'
+        };
+
+        // "Belknap 1", "Belk.01", "Hills37", "Coos01", "Straf 02" → "BE1", "HI37", "CO1", "ST2"
+        function normalizeDistrictCode(districtStr) {
+            if (!districtStr) return null;
+            const m = districtStr.toUpperCase().trim().match(/^([A-Z]+)[\s.]*0*(\d+)$/);
+            if (!m) return null;
+            const code2 = COUNTY_TO_CODE[m[1]];
+            if (!code2) return null;
+            return code2 + parseInt(m[2], 10);
         }
-        
-        function lookupByAddress() {
-            const addressString = addressInput.value.trim();
-            if (!addressString) {
-                alert('Please enter your address');
+
+        // Index reps by district code: "BE1" → [rep, rep, ...] (de-duplicated by name)
+        const repsByDistrictCode = (() => {
+            const idx = {};
+            const seen = {};
+            Object.values(votingData).forEach(townData => {
+                (townData.reps || []).forEach(rep => {
+                    const code = normalizeDistrictCode(rep.district);
+                    if (!code) return;
+                    const key = code + '|' + rep.name;
+                    if (seen[key]) return;
+                    seen[key] = true;
+                    (idx[code] = idx[code] || []).push(rep);
+                });
+            });
+            return idx;
+        })();
+
+        // Lazy-loaded geojson — fetched on first lookup
+        let _districtsLoaded = false;
+        let _districtsLoading = null;
+        let BASE_DISTRICTS_GJ = null;
+        let FLOTERIAL_DISTRICTS_GJ = null;
+
+        function loadDistricts() {
+            if (_districtsLoaded) return Promise.resolve();
+            if (_districtsLoading) return _districtsLoading;
+            _districtsLoading = Promise.all([
+                fetch('data/nh-house-base-districts.geojson').then(r => r.json()),
+                fetch('data/nh-house-floterial-districts.geojson').then(r => r.json())
+            ]).then(([base, flot]) => {
+                BASE_DISTRICTS_GJ = base;
+                FLOTERIAL_DISTRICTS_GJ = flot;
+                _districtsLoaded = true;
+            });
+            return _districtsLoading;
+        }
+
+        // Mapbox autocomplete dropdown
+        let addressDebounce = null;
+        addressInput.addEventListener('input', function() {
+            clearTimeout(addressDebounce);
+            const q = this.value.trim();
+            closeAllLists();
+            if (q.length < 3) return;
+            addressDebounce = setTimeout(() => fetchAddressSuggestions(q), 300);
+        });
+
+        addressInput.addEventListener('keydown', function(e) {
+            if (e.keyCode === 13) {
+                e.preventDefault();
+                closeAllLists();
+                lookupByAddress();
+            }
+        });
+
+        async function fetchAddressSuggestions(query) {
+            try {
+                const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json` +
+                            `?access_token=${MAPBOX_TOKEN}&country=us&region=US-NH&types=address&limit=5&autocomplete=true`;
+                const resp = await fetch(url);
+                const data = await resp.json();
+                if (!data.features || data.features.length === 0) return;
+
+                closeAllLists();
+                const list = document.createElement('div');
+                list.setAttribute('id', 'autocomplete-list');
+                list.setAttribute('class', 'autocomplete-items');
+                addressInput.parentNode.appendChild(list);
+
+                data.features.forEach(feat => {
+                    const item = document.createElement('div');
+                    item.textContent = feat.place_name;
+                    const select = function() {
+                        addressInput.value = feat.place_name;
+                        closeAllLists();
+                        const lng = feat.geometry.coordinates[0];
+                        const lat = feat.geometry.coordinates[1];
+                        runDistrictLookup(feat.place_name, lng, lat);
+                    };
+                    item.addEventListener('click', select);
+                    item.addEventListener('touchend', function(e) { e.preventDefault(); select(); });
+                    list.appendChild(item);
+                });
+            } catch (e) { /* silently fail */ }
+        }
+
+        async function lookupByAddress() {
+            const address = addressInput.value.trim();
+            if (!address) { alert('Please enter your address'); return; }
+
+            setStatus('Looking up address...');
+            try {
+                const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json` +
+                            `?access_token=${MAPBOX_TOKEN}&country=us&region=US-NH&types=address&limit=1`;
+                const resp = await fetch(url);
+                const data = await resp.json();
+                if (!data.features || data.features.length === 0) {
+                    setStatus('');
+                    showAddressError(`We couldn't find "${address}". Try including your city and state, e.g., "123 Main St, Concord, NH".`);
+                    return;
+                }
+                const feat = data.features[0];
+                const lng = feat.geometry.coordinates[0];
+                const lat = feat.geometry.coordinates[1];
+                runDistrictLookup(feat.place_name, lng, lat);
+            } catch (e) {
+                setStatus('');
+                showAddressError('Something went wrong looking up that address. Please try again.');
+            }
+        }
+
+        async function runDistrictLookup(matchedAddress, lng, lat) {
+            setStatus('Finding your districts...');
+            try {
+                await loadDistricts();
+            } catch (e) {
+                setStatus('');
+                showAddressError('Could not load district map data. Make sure the page is served over http (not opened directly from disk).');
                 return;
             }
-            
-            const parsed = parseAddress(addressString);
-            
-            // Try ward-specific lookup first
-            if (parsed.ward && wardMapping[parsed.fullKey]) {
-                const districts = wardMapping[parsed.fullKey];
-                displayResultsByDistricts(parsed.fullKey, districts);
+
+            const point = turf.point([lng, lat]);
+            const codes = new Set();
+
+            // Normalize geojson code (e.g., "HI03" → "HI3", "HI37" → "HI37")
+            const normGeo = (c) => {
+                const m = (c || '').trim().toUpperCase().match(/^([A-Z]{2})0*(\d+)$/);
+                return m ? m[1] + parseInt(m[2], 10) : null;
+            };
+
+            for (const feature of BASE_DISTRICTS_GJ.features) {
+                try {
+                    if (turf.booleanPointInPolygon(point, feature)) {
+                        const c = normGeo(feature.properties.basehse22);
+                        if (c) codes.add(c);
+                    }
+                } catch (_) {}
+            }
+            for (const feature of FLOTERIAL_DISTRICTS_GJ.features) {
+                try {
+                    if (turf.booleanPointInPolygon(point, feature)) {
+                        const c = normGeo(feature.properties.floathse22);
+                        if (c) codes.add(c);
+                    }
+                } catch (_) {}
+            }
+
+            setStatus('');
+
+            if (codes.size === 0) {
+                showAddressError('Address found, but it does not appear to be inside a NH House district. Please check that you entered a New Hampshire address.');
                 return;
             }
-            
-            // Fall back to city/town lookup
-            if (votingData[parsed.city]) {
-                displayResults(parsed.city);
+
+            // Collect reps from votingData using the geo district codes
+            const allReps = [];
+            const seen = new Set();
+            const matchedDistrictNames = [];
+            const unmatchedCodes = [];
+            codes.forEach(code => {
+                const reps = repsByDistrictCode[code];
+                if (reps && reps.length) {
+                    reps.forEach(rep => {
+                        const key = rep.name + '|' + rep.district;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        allReps.push(rep);
+                        if (!matchedDistrictNames.includes(rep.district)) matchedDistrictNames.push(rep.district);
+                    });
+                } else {
+                    unmatchedCodes.push(code);
+                }
+            });
+
+            if (allReps.length === 0) {
+                showAddressError(`Found districts (${[...codes].join(', ')}) but no matching representatives in our voting data.`);
                 return;
             }
-            
-            // Not found
-            const resultsContainer = document.getElementById('results').querySelector('.container') || 
+
+            const label = matchedDistrictNames.length
+                ? `${matchedAddress} — ${matchedDistrictNames.join(', ')}`
+                : matchedAddress;
+            displayResultsByDistricts(label, matchedDistrictNames);
+        }
+
+        function setStatus(msg) {
+            if (!msg) {
+                addressLookupStatus.style.display = 'none';
+                addressLookupStatus.textContent = '';
+            } else {
+                addressLookupStatus.style.display = 'block';
+                addressLookupStatus.textContent = msg;
+            }
+        }
+
+        function showAddressError(msg) {
+            const resultsContainer = document.getElementById('results').querySelector('.container') ||
                                     document.getElementById('results').appendChild(document.createElement('div'));
             resultsContainer.className = 'container';
-            resultsContainer.innerHTML = `
-                <div class="no-results">
-                    <p>We couldn't find representatives for "${addressString}".</p>
-                    <p>Please try entering just your city/town name (e.g., "Manchester", "Concord", "Nashua").</p>
-                    <p>For cities with wards, include the ward number (e.g., "Manchester Ward 5").</p>
-                </div>
-            `;
+            resultsContainer.innerHTML = `<div class="no-results"><p>${msg}</p></div>`;
         }
         
         function displayResultsByDistricts(locationName, districts) {
@@ -16603,16 +16754,8 @@
             resultsContainer.innerHTML = html;
         }
         
-        // Button click handler
+        // Button click handler (Enter handler is bound above with autocomplete)
         findRepButton.addEventListener('click', lookupByAddress);
-        
-        // Also allow Enter key in address input
-        addressInput.addEventListener('keydown', function(e) {
-            if (e.keyCode === 13) {
-                e.preventDefault();
-                lookupByAddress();
-            }
-        });
 
         // Autocomplete functionality for TOWN search (kept for backwards compatibility)
         const input = document.getElementById('townInput');
